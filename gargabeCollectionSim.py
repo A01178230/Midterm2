@@ -1,0 +1,656 @@
+"""
+garbage_collection_agentpy.py
+
+Multi-agent garbage collection simulator with:
+ - A* and a compact D* Lite (incremental replanning)
+ - Voronoi partitioning (KDTree-based)
+ - AgentPy model for RL-style simulation and training
+ - Simulator/benchmarks + GIF export
+
+Usage:
+    pip install numpy scipy matplotlib pillow agentpy
+    python garbage_collection_agentpy.py --demo
+    python garbage_collection_agentpy.py --run-tests
+    python garbage_collection_agentpy.py --benchmark
+
+Note: AgentPy must be installed to run the RL model parts.
+"""
+
+from __future__ import annotations
+import argparse
+import csv
+import os
+import random
+import time
+import math
+from collections import deque, defaultdict
+from typing import List, Tuple, Dict, Optional
+
+import numpy as np
+from scipy.spatial import KDTree
+import heapq
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.animation as animation
+from matplotlib.animation import PillowWriter
+
+# AgentPy for RL/simulation model
+try:
+    import agentpy as ap
+except Exception as e:
+    ap = None  # AgentPy optional but recommended
+
+# -----------------------------
+# Configuration and utilities
+# -----------------------------
+DEFAULT_CONFIG = {
+    'width': 40,
+    'height': 28,
+    'n_trucks': 4,
+    'n_bins': 40,
+    'n_obstacles': 80,
+    'n_depots': 3,
+    'bin_capacity': 100.0,
+    'bin_fill_rate': 1.0,            # per timestep
+    'bin_fill_threshold': 0.8,       # fraction to trigger service
+    'truck_capacity': 200.0,
+    'truck_energy': 500.0,
+    'truck_energy_per_step': 1.0,
+    'truck_speed': 1,                # grid cells per step (not used for fractional moves)
+    'seed': 0,
+    'gif_path': 'garbage_sim.gif',
+    'frame_interval_ms': 200,
+    'benchmark_repeats': 3,
+}
+
+_rng = random.Random()
+
+GridPos = Tuple[int, int]
+
+# -----------------------------
+# Grid and Entities
+# -----------------------------
+class GridWorld:
+    def __init__(self, width: int, height: int, obstacle_prob: float = 0.0, seed: Optional[int] = None):
+        if seed is not None:
+            np.random.seed(seed); _rng.seed(seed)
+        self.width = width
+        self.height = height
+        self.grid = np.zeros((height, width), dtype=np.int8)  # 0 free, 1 obstacle
+        if obstacle_prob > 0:
+            for y in range(height):
+                for x in range(width):
+                    if _rng.random() < obstacle_prob:
+                        self.grid[y, x] = 1
+
+    def in_bounds(self, p: GridPos) -> bool:
+        x, y = p
+        return 0 <= x < self.width and 0 <= y < self.height
+
+    def is_free(self, p: GridPos) -> bool:
+        x, y = p
+        return self.in_bounds(p) and self.grid[y, x] == 0
+
+    def neighbors(self, p: GridPos) -> List[GridPos]:
+        x, y = p
+        cand = [(x+1,y),(x-1,y),(x,y+1),(x,y-1)]
+        return [q for q in cand if self.is_free(q)]
+
+    def random_free_cell(self) -> GridPos:
+        while True:
+            x = _rng.randrange(self.width)
+            y = _rng.randrange(self.height)
+            if self.grid[y, x] == 0:
+                return (x, y)
+
+class Bin:
+    def __init__(self, pos: GridPos, capacity: float, fill_rate: float = 1.0):
+        self.pos = pos
+        self.capacity = capacity
+        self.fill_rate = fill_rate
+        self.level = 0.0
+
+    def step(self):
+        self.level = min(self.capacity, self.level + self.fill_rate)
+
+    def needs_service(self, threshold: float) -> bool:
+        return self.level >= threshold * self.capacity
+
+    def empty(self):
+        self.level = 0.0
+
+class Depot:
+    def __init__(self, pos: GridPos):
+        self.pos = pos
+
+class Truck:
+    def __init__(self, id: int, pos: GridPos, capacity: float, energy: float, energy_per_step: float):
+        self.id = id
+        self.pos = pos
+        self.capacity = capacity
+        self.load = 0.0
+        self.energy = energy
+        self.energy_per_step = energy_per_step
+        self.home_depot: Optional[int] = None
+        self.path: List[GridPos] = []
+        self.state = 'idle'  # idle, to_bin, to_depot, unloading
+
+    def step_cost(self):
+        return self.energy_per_step
+
+    def is_full(self):
+        return self.load >= self.capacity
+
+# -----------------------------
+# A* Pathfinding
+# -----------------------------
+def manhattan(a: GridPos, b: GridPos) -> int:
+    return abs(a[0]-b[0]) + abs(a[1]-b[1])
+
+def astar(grid: GridWorld, start: GridPos, goal: GridPos) -> Optional[List[GridPos]]:
+    if start == goal:
+        return [start]
+    openq = []
+    heapq.heappush(openq, (manhattan(start,goal), 0, start, None))
+    came_from = {}
+    gscore = {start: 0}
+    closed = set()
+    while openq:
+        f, g, node, parent = heapq.heappop(openq)
+        if node in closed:
+            continue
+        closed.add(node)
+        came_from[node] = parent
+        if node == goal:
+            path = []
+            cur = node
+            while cur is not None:
+                path.append(cur)
+                cur = came_from[cur]
+            return list(reversed(path))
+        for neigh in grid.neighbors(node):
+            ng = g + 1
+            if neigh in closed:
+                continue
+            if neigh not in gscore or ng < gscore[neigh]:
+                gscore[neigh] = ng
+                heapq.heappush(openq, (ng + manhattan(neigh,goal), ng, neigh, node))
+    return None
+
+# -----------------------------
+# Compact D* Lite (incremental)
+# -----------------------------
+class DStarLite:
+    def __init__(self, grid: GridWorld, start: GridPos, goal: GridPos):
+        self.grid = grid
+        self.start = start
+        self.goal = goal
+        self.g = defaultdict(lambda: float('inf'))
+        self.rhs = defaultdict(lambda: float('inf'))
+        self.U = []
+        self.km = 0.0
+        self.rhs[goal] = 0.0
+        self._push(goal)
+
+    def _heuristic(self, s: GridPos) -> float:
+        return manhattan(self.start, s)
+
+    def _key(self, s: GridPos):
+        g_rhs = min(self.g.get(s, float('inf')), self.rhs.get(s, float('inf')))
+        return (g_rhs + self._heuristic(s) + self.km, g_rhs)
+
+    def _push(self, s: GridPos):
+        heapq.heappush(self.U, (self._key(s), s))
+
+    def _update_vertex(self, u: GridPos):
+        if u != self.goal:
+            vals = []
+            for v in self.grid.neighbors(u):
+                vals.append(1 + self.g.get(v, float('inf')))
+            self.rhs[u] = min(vals) if vals else float('inf')
+        self._push(u)
+
+    def compute_shortest_path(self, max_iters=10000):
+        it = 0
+        while self.U and it < max_iters:
+            it += 1
+            (k_old, _), u = heapq.heappop(self.U)
+            k_new = self._key(u)
+            if k_old < k_new:
+                self._push(u); continue
+            if self.g.get(u, float('inf')) > self.rhs.get(u, float('inf')):
+                self.g[u] = self.rhs[u]
+                for s in self.grid.neighbors(u):
+                    self._update_vertex(s)
+            else:
+                g_old = self.g.get(u, float('inf'))
+                self.g[u] = float('inf')
+                for s in self.grid.neighbors(u) + [u]:
+                    self._update_vertex(s)
+        return self._extract_path()
+
+    def _extract_path(self) -> List[GridPos]:
+        if self.g.get(self.start, float('inf')) == float('inf'):
+            return []
+        path = [self.start]
+        cur = self.start
+        visited = set([cur])
+        while cur != self.goal:
+            succs = list(self.grid.neighbors(cur))
+            if not succs:
+                return []
+            best = min(succs, key=lambda v: 1 + self.g.get(v, float('inf')))
+            if best in visited:
+                return []
+            path.append(best)
+            visited.add(best)
+            cur = best
+        return path
+
+    def notify_edge_change(self, u: GridPos, v: GridPos):
+        self._update_vertex(u)
+        self._update_vertex(v)
+
+# -----------------------------
+# Voronoi Partitioning
+# -----------------------------
+class VoronoiPartitioner:
+    def __init__(self, points: List[GridPos], world: GridWorld):
+        self.points = np.array(points, dtype=float)
+        self.world = world
+        self.kdt = KDTree(self.points)
+
+    def region_of(self, pos: GridPos) -> int:
+        dist, idx = self.kdt.query([pos], k=1)
+        idx = np.asarray(idx)
+        # Manejar tanto scalares como arrays
+        if idx.ndim == 0:
+            return int(idx)
+        else:
+            return int(idx[0])
+
+    def assignment_map(self) -> np.ndarray:
+        h, w = self.world.height, self.world.width
+        grid_pts = np.array([(x,y) for y in range(h) for x in range(w)])
+        dists = ((grid_pts[:,None,:] - self.points[None,:,:])**2).sum(axis=2)
+        labels = np.argmin(dists, axis=1)
+        return labels.reshape((h,w))
+
+# -----------------------------
+# AgentPy Model for RL-compatible simulation
+# -----------------------------
+if ap is not None:
+    class TrashCollectionModel(ap.Model):
+        def setup(self):
+            # parameters (use defaults if not provided)
+            self.width = self.p.get('width', DEFAULT_CONFIG['width'])
+            self.height = self.p.get('height', DEFAULT_CONFIG['height'])
+            self.n_agents = self.p.get('n_trucks', DEFAULT_CONFIG['n_trucks'])
+            self.n_bins = self.p.get('n_bins', DEFAULT_CONFIG['n_bins'])
+            self.n_depots = self.p.get('n_depots', DEFAULT_CONFIG['n_depots'])
+            self.bin_capacity = self.p.get('bin_capacity', DEFAULT_CONFIG['bin_capacity'])
+            self.bin_threshold = self.p.get('bin_fill_threshold', DEFAULT_CONFIG['bin_fill_threshold'])
+            self.energy_max = self.p.get('truck_energy', DEFAULT_CONFIG['truck_energy'])
+            self.capacity_max = self.p.get('truck_capacity', DEFAULT_CONFIG['truck_capacity'])
+
+            # grid and agent lists
+            self.grid = ap.Grid(self, (self.width, self.height), track_agents=True)
+            self.trucks = ap.AgentList(self, self.n_agents)
+            self.bins = ap.AgentList(self, self.n_bins)
+            self.depots = ap.AgentList(self, self.n_depots)
+
+            # place depots
+            for d in self.depots:
+                pos = (self.random_int(0, self.width - 1), self.random_int(0, self.height - 1))
+                self.grid.place(d, pos)
+
+            # place bins
+            for b in self.bins:
+                pos = (self.random_int(0, self.width - 1), self.random_int(0, self.height - 1))
+                self.grid.place(b, pos)
+                b.fill = 0.0
+                b.capacity = self.bin_capacity
+
+            # place trucks
+            for t in self.trucks:
+                pos = (self.random_int(0, self.width - 1), self.random_int(0, self.height - 1))
+                self.grid.place(t, pos)
+                t.energy = self.energy_max
+                t.load = 0.0
+                t.capacity = self.capacity_max
+                t.state = 'idle'
+
+            # convenience: compute Voronoi centers based on depots
+            depot_points = [self.grid.positions[d] for d in self.depots]
+            if len(depot_points) == 0:
+                depot_points = [(0,0)]
+            self.partitioner = VoronoiPartitioner(depot_points, GridWorld(self.width, self.height))
+
+        def step(self):
+            # bins fill
+            for b in self.bins:
+                b.fill = min(b.capacity, b.fill + self.p.get('bin_fill_rate', DEFAULT_CONFIG['bin_fill_rate']))
+
+            # for each truck, do a greedy action (placeholder for policy)
+            for t in self.trucks:
+                # energy decay
+                t.energy = max(0.0, t.energy - self.p.get('truck_energy_per_step', DEFAULT_CONFIG['truck_energy_per_step']))
+                if t.energy <= 0.0:
+                    t.state = 'idle'
+                    continue
+
+                # find bins in truck's partition needing service
+                pos = self.grid.positions[t]
+                my_region = self.partitioner.region_of(pos)
+                candidate_bins = [b for b in self.bins if b.fill >= b.capacity * self.bin_threshold and self.partitioner.region_of(self.grid.positions[b]) == my_region]
+                if not candidate_bins:
+                    candidate_bins = [b for b in self.bins if b.fill >= b.capacity * self.bin_threshold]
+
+                if candidate_bins:
+                    # pick nearest candidate
+                    distances = [manhattan(pos, self.grid.positions[b]) for b in candidate_bins]
+                    target = candidate_bins[int(np.argmin(distances))]
+                    tx, ty = pos
+                    bx, by = self.grid.positions[target]
+
+                    nx = tx + (1 if bx > tx else -1 if bx < tx else 0)
+                    ny = ty + (1 if by > ty else -1 if by < ty else 0)
+                    # move if free
+                    if 0 <= nx < self.width and 0 <= ny < self.height:
+                        try:
+                            self.grid.move_to(t, (nx, ny))
+                        except Exception:
+                            pass
+
+                    # attempt collect if on same cell
+                    if self.grid.positions[t] == self.grid.positions[target]:
+                        collect = min(target.fill, t.capacity - t.load)
+                        t.load += collect
+                        target.fill -= collect
+                        # if full or low energy, head to depot next step
+                        if t.load >= t.capacity or t.energy < self.energy_max * 0.2:
+                            t.state = 'to_depot'
+                        else:
+                            t.state = 'idle'
+                else:
+                    # no bin to service: idle or return if low energy / full
+                    if t.load >= t.capacity or t.energy < self.energy_max * 0.2:
+                        # move to nearest depot
+                        depot_positions = [self.grid.positions[d] for d in self.depots]
+                        if depot_positions:
+                            dists = [manhattan(self.grid.positions[t], dp) for dp in depot_positions]
+                            dp = depot_positions[int(np.argmin(dists))]
+                            tx, ty = self.grid.positions[t]
+                            dx, dy = dp
+                            nx = tx + (1 if dx > tx else -1 if dx < tx else 0)
+                            ny = ty + (1 if dy > ty else -1 if dy < ty else 0)
+                            if 0 <= nx < self.width and 0 <= ny < self.height:
+                                try:
+                                    self.grid.move_to(t, (nx, ny))
+                                except Exception:
+                                    pass
+                            if self.grid.positions[t] == dp:
+                                t.load = 0.0
+                                t.energy = self.energy_max
+                                t.state = 'idle'
+                    else:
+                        t.state = 'idle'
+
+# -----------------------------
+# Simulator (non-AgentPy) for benchmarks & GIFs
+# -----------------------------
+class Simulator:
+    def __init__(self, config: dict):
+        self.config = config.copy()
+        _rng.seed(self.config.get('seed', 0))
+        self.world = GridWorld(self.config['width'], self.config['height'], obstacle_prob=0.0, seed=self.config.get('seed',0))
+        # place random obstacles
+        for _ in range(self.config['n_obstacles']):
+            x = _rng.randrange(self.world.width); y = _rng.randrange(self.world.height)
+            self.world.grid[y,x] = 1
+        # bins, depots, trucks
+        self.bins: List[Bin] = []
+        for _ in range(self.config['n_bins']):
+            pos = self.world.random_free_cell()
+            self.bins.append(Bin(pos, self.config['bin_capacity'], fill_rate=self.config['bin_fill_rate']))
+        self.depots: List[Depot] = []
+        for _ in range(self.config['n_depots']):
+            pos = self.world.random_free_cell()
+            self.depots.append(Depot(pos))
+        self.trucks: List[Truck] = []
+        for i in range(self.config['n_trucks']):
+            pos = self.world.random_free_cell()
+            t = Truck(i, pos, capacity=self.config['truck_capacity'], energy=self.config['truck_energy'], energy_per_step=self.config['truck_energy_per_step'])
+            dists = [manhattan(pos, d.pos) for d in self.depots]
+            t.home_depot = int(np.argmin(dists)) if dists else 0
+            self.trucks.append(t)
+        depot_points = [d.pos for d in self.depots]
+        if not depot_points:
+            depot_points = [(0,0)]
+        self.partitioner = VoronoiPartitioner(depot_points, self.world)
+
+    def step_bins(self):
+        for b in self.bins:
+            b.step()
+
+    def find_bins_needing_service(self) -> List[int]:
+        return [i for i,b in enumerate(self.bins) if b.needs_service(self.config['bin_fill_threshold'])]
+
+    def plan_with_astar(self, truck: Truck, goal: GridPos) -> Optional[List[GridPos]]:
+        return astar(self.world, truck.pos, goal)
+
+    def run_episode(self, max_steps=500, render=False):
+        frames = []
+        stats = {'serviced':0, 'energy_penalties':0, 'collisions':0}
+        for step in range(max_steps):
+            self.step_bins()
+            need_bins = self.find_bins_needing_service()
+            assigned = set()
+            for t in self.trucks:
+                if t.state == 'idle' or not t.path:
+                    bins_in_partition = [i for i in need_bins if self.partitioner.region_of(self.bins[i].pos) == self.partitioner.region_of(t.pos)]
+                    if not bins_in_partition:
+                        bins_in_partition = need_bins
+                    if bins_in_partition:
+                        bid = min(bins_in_partition, key=lambda i: manhattan(t.pos, self.bins[i].pos))
+                        assigned.add(bid)
+                        path = self.plan_with_astar(t, self.bins[bid].pos)
+                        if path:
+                            t.path = path
+                            t.state = 'to_bin'
+            occupied = defaultdict(list)
+            for t in self.trucks:
+                if t.path and len(t.path) > 0:
+                    nextpos = t.path.pop(0)
+                    t.energy -= t.step_cost()
+                    t.pos = nextpos
+                    occupied[t.pos].append(t.id)
+                    if t.state == 'to_bin' and any(b.pos == t.pos for b in self.bins):
+                        b_idx = next(i for i,b in enumerate(self.bins) if b.pos == t.pos)
+                        amount = min(self.bins[b_idx].level, t.capacity - t.load)
+                        t.load += amount
+                        self.bins[b_idx].level -= amount
+                        stats['serviced'] += 1
+                        if t.is_full() or t.energy < 0.1 * self.config['truck_energy']:
+                            depotpos = self.depots[t.home_depot].pos
+                            path = self.plan_with_astar(t, depotpos)
+                            t.path = path if path else []
+                            t.state = 'to_depot'
+                else:
+                    if t.energy <= 0:
+                        stats['energy_penalties'] += 1
+                        t.energy = 0
+                        t.state = 'idle'
+            for pos, ids in occupied.items():
+                if len(ids) > 1:
+                    stats['collisions'] += len(ids)-1
+            if render:
+                frames.append(self.render_frame())
+        return stats, frames
+
+    def render_frame(self):
+        """Render a frame of the environment to an RGB numpy array."""
+        fig, ax = plt.subplots(figsize=(6, 6))
+
+        # --- FIX: usar dimensiones reales ---
+        ax.set_xlim(-0.5, self.world.width - 0.5)
+        ax.set_ylim(-0.5, self.world.height - 0.5)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.set_aspect('equal')
+
+        # FIX: nueva forma de obtener colormap
+        cmap = matplotlib.colormaps.get_cmap('tab10')
+
+        # --- Obstacles ---
+        # FIX: obstacles están dentro de self.world.grid (1 == obstacle)
+        for y in range(self.world.height):
+            for x in range(self.world.width):
+                if self.world.grid[y, x] == 1:
+                    ax.add_patch(
+                        plt.Rectangle((x - 0.5, y - 0.5), 1, 1, color='black')
+                    )
+
+        # --- Depots ---
+        for d in self.depots:
+            x, y = d.pos
+            ax.add_patch(
+                plt.Circle((x, y), 0.4, color='gold')
+            )
+
+        # --- Bins ---
+        for b in self.bins:
+            x, y = b.pos
+            fill_ratio = b.level / b.capacity
+            ax.add_patch(
+                plt.Rectangle((x - 0.4, y - 0.4), 0.8, 0.8, color=(1, 0, 0, fill_ratio))
+            )
+
+        # --- Trucks ---
+        for i, t in enumerate(self.trucks):
+            x, y = t.pos
+            ax.scatter(
+                x, y,
+                s=150,
+                color=cmap(i % 10),
+                edgecolors='white',
+                linewidth=1.5,
+                zorder=5
+            )
+
+        # Render canvas
+        fig.canvas.draw()
+
+        # Convertir a array
+        buf = np.asarray(fig.canvas.buffer_rgba())  # devuelve un array RGBA
+        img = buf[:, :, :3].copy()  # convertimos RGBA → RGB
+
+        plt.close(fig)
+        return img
+
+# -----------------------------
+# Benchmark utilities
+# -----------------------------
+def run_benchmark(config: dict, repeats: int=3, out_csv: str='benchmark.csv'):
+    header = ['scenario','rep','n_trucks','n_bins','n_obstacles','plan_time_s','sim_time_s','serviced','energy_penalties','collisions']
+    rows = []
+    for rep in range(repeats):
+        sim = Simulator(config)
+        t0 = time.time()
+        plan_time = 0.0
+        for t in sim.trucks:
+            if not sim.bins:
+                continue
+            bid = min(range(len(sim.bins)), key=lambda i: manhattan(t.pos, sim.bins[i].pos))
+            st = time.time()
+            p = sim.plan_with_astar(t, sim.bins[bid].pos)
+            plan_time += time.time() - st
+        stats, frames = sim.run_episode(max_steps=200, render=False)
+        sim_time = 0.0  # included in stats timing if needed
+        rows.append(['default', rep, config['n_trucks'], config['n_bins'], config['n_obstacles'], round(plan_time,4), round(sim_time,4), stats['serviced'], stats['energy_penalties'], stats['collisions']])
+        print(f'bench rep {rep} plan_time {plan_time:.3f}s serviced {stats["serviced"]}')
+    with open(out_csv, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(header)
+        writer.writerows(rows)
+    print(f'Benchmark results written to {out_csv}')
+    return rows
+
+# -----------------------------
+# GIF export helper
+# -----------------------------
+def save_frames_as_gif(frames: List[np.ndarray], filename: str, interval_ms: int = 200):
+    if not frames:
+        return
+    fig = plt.figure(figsize=(6,4)); plt.axis('off')
+    im = plt.imshow(frames[0])
+    def update(i):
+        im.set_data(frames[i]); return [im]
+    ani = animation.FuncAnimation(fig, update, frames=len(frames), interval=interval_ms, blit=True)
+    writer = PillowWriter(fps=1000/interval_ms)
+    ani.save(filename, writer=writer)
+    plt.close(fig)
+
+# -----------------------------
+# Demo / CLI
+# -----------------------------
+def demo(config=None):
+    cfg = DEFAULT_CONFIG.copy()
+    if config:
+        cfg.update(config)
+    sim = Simulator(cfg)
+    stats, frames = sim.run_episode(max_steps=300, render=True)
+    if frames:
+        save_frames_as_gif(frames, cfg['gif_path'], interval_ms=cfg['frame_interval_ms'])
+        print('Saved GIF to', cfg['gif_path'])
+    print('Simulation stats:', stats)
+
+# -----------------------------
+# Unit tests (basic correctness checks)
+# -----------------------------
+def _test_astar():
+    g = GridWorld(10,8, obstacle_prob=0.1, seed=1)
+    s = g.random_free_cell(); t = g.random_free_cell()
+    path = astar(g, s, t)
+    assert path is None or (path[0] == s and path[-1] == t)
+    print('A* test OK')
+
+def _test_voronoi():
+    g = GridWorld(20,14, obstacle_prob=0.0, seed=2)
+    pts = [g.random_free_cell() for _ in range(3)]
+    vp = VoronoiPartitioner(pts, g)
+    for _ in range(10):
+        p = g.random_free_cell()
+        r = vp.region_of(p)
+        assert 0 <= r < len(pts)
+    print('Voronoi test OK')
+
+def _test_dstar():
+    g = GridWorld(12,10, obstacle_prob=0.0, seed=3)
+    s = (0,0); goal=(11,9)
+    d = DStarLite(g, s, goal)
+    path = d.compute_shortest_path()
+    assert isinstance(path, list)
+    print('D* Lite test OK')
+
+# -----------------------------
+# CLI handling
+# -----------------------------
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument('--demo', action='store_true')
+    p.add_argument('--benchmark', action='store_true')
+    p.add_argument('--run-tests', action='store_true')
+    p.add_argument('--no-agentpy', action='store_true', help='Run without requiring AgentPy (skip RL model)')
+    return p.parse_args()
+
+if __name__ == '__main__':
+    args = parse_args()
+    if args.run_tests:
+        _test_astar(); _test_voronoi(); _test_dstar()
+    if args.demo:
+        demo()
+    if args.benchmark:
+        cfg = DEFAULT_CONFIG.copy()
+        run_benchmark(cfg, repeats=cfg['benchmark_repeats'])
