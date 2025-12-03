@@ -36,6 +36,7 @@ import matplotlib.animation as animation
 from matplotlib.animation import PillowWriter
 from matplotlib.patches import Rectangle, Circle
 import matplotlib.lines as mlines
+from PIL import Image
 
 # AgentPy for RL/simulation model
 try:
@@ -47,8 +48,8 @@ except Exception as e:
 # Configuration and utilities
 # -----------------------------
 DEFAULT_CONFIG = {
-    'width': 100,
-    'height': 100,
+    'width': 14,
+    'height': 14,
     'n_trucks': 4,
     'n_bins': 20,
     'n_obstacles': 10,
@@ -570,7 +571,7 @@ class Simulator:
         # ===============================
         for depot in self.depots:
             x, y = depot.pos
-            ax.scatter(x, y, c='purple', s=140, marker='D')
+            ax.scatter(x, y, c='yellow', s=140, marker='D')
 
         # ===============================
         # BINS
@@ -596,7 +597,7 @@ class Simulator:
             ax.scatter(x, y, c=color, s=40, marker='s', alpha=0.9)
 
         # ===============================
-        # PATHS (opcional)
+        # PATHS
         # ===============================
         for t in self.trucks:
             if t.path and len(t.path) > 0:
@@ -626,36 +627,42 @@ class Simulator:
     # Frame de salida para GIF
     # ----------------------------------------------------------------
     def render_frame(self):
-        fig, ax = plt.subplots(figsize=(10, 7), dpi=300)
+        # Figura con dos columnas: mundo (izq) y leyenda (der)
+        fig, (ax, ax_leg) = plt.subplots(
+            1, 2, figsize=(12, 7), dpi=200, gridspec_kw={'width_ratios': [4, 1]}
+        )
 
-        ax.set_xlim(-1, self.world.width + 1)
-        ax.set_ylim(-1, self.world.height + 1)
+        ax.set_xlim(-0.5, self.world.width - 0.5)
+        ax.set_ylim(-0.5, self.world.height - 0.5)
         ax.set_aspect('equal')
-
-        # cuadrícula ligera
         ax.grid(True, alpha=0.25)
-
         ax.set_title(f"Garbage Collection Simulation — Step {self.t}")
 
-        # Dibujar entidades
+        # Dibujar el mundo en el eje izquierdo
         self.draw_clean_world(ax)
 
-        # Renderizamos
+        # Preparar eje lateral para la leyenda (sin ejes)
+        ax_leg.axis('off')
+
+        # Crear handles legibles para la leyenda lateral
+        handles = [
+            mlines.Line2D([], [], color='blue', marker='s', markersize=10, linestyle='None', label='Truck'),
+            mlines.Line2D([], [], color='green', marker='o', markersize=10, linestyle='None', label='Bin (empty)'),
+            mlines.Line2D([], [], color='red', marker='o', markersize=10, linestyle='None', label='Bin (ready)'),
+            mlines.Line2D([], [], color='gold', marker='D', markersize=10, linestyle='None', label='Depot'),
+            mlines.Line2D([], [], color='black', marker='x', markersize=10, linestyle='None', label='Obstacle'),
+            mlines.Line2D([], [], color='b', linestyle='--', label='Planned path')
+        ]
+
+        # Colocar la leyenda centrada
+        ax_leg.legend(handles=handles, loc='center', fontsize=10, frameon=False, title='Legend')
+
+        # Exportar la figura a array RGB al tamaño y dpi actuales (preserva resolución)
         fig.canvas.draw()
-
-        # Tomamos ARGB (que siempre existe)
-        argb = np.frombuffer(fig.canvas.tostring_argb(), dtype=np.uint8)
-
-        w, h = fig.canvas.get_width_height()
-
-        # Convertir ARGB → RGB
-        argb = argb.reshape((h, w, 4))
-        rgb = argb[:, :, 1:]   # ignorar canal alfa
-
-        img = rgb.copy()
+        buf = np.asarray(fig.canvas.buffer_rgba())   # <-- compatible y moderno
+        img = buf[:, :, :3].copy()                    # quitar alpha
 
         plt.close(fig)
-
         return img
 
 
@@ -691,28 +698,25 @@ def run_benchmark(config: dict, repeats: int=3, out_csv: str='benchmark.csv'):
 # GIF export helper
 # -----------------------------
 def save_frames_as_gif(frames, filename, interval_ms=200):
+    """Save a list of RGB numpy arrays as an animated GIF using Pillow.
+
+    This preserves the native resolution of the frames (no resampling
+    by Matplotlib) and lets us control duration per frame.
+    """
     if not frames:
         print("No frames to save.")
         return
-    fig = plt.figure(figsize=(6, 6))
-    plt.axis('off')
-    im = plt.imshow(frames[0])
 
-    def update(i):
-        im.set_data(frames[i])
-        return [im]
-
-    ani = animation.FuncAnimation(
-        fig, update,
-        frames=len(frames),
-        interval=interval_ms,
-        blit=True
+    images = [Image.fromarray(frame.astype('uint8')) for frame in frames]
+    # duration is in milliseconds per frame
+    images[0].save(
+        filename,
+        save_all=True,
+        append_images=images[1:],
+        duration=interval_ms,
+        loop=0,
+        optimize=True
     )
-
-    writer = PillowWriter(fps=1000 / interval_ms)
-    ani.save(filename, writer=writer)
-
-    plt.close(fig)
 
 # -----------------------------
 # Demo / CLI
