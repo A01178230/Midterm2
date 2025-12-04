@@ -560,8 +560,41 @@ class Simulator:
 
                         path = self.plan_with_astar(t, bsel.pos)
                         if path:
-                            t.path = path
-                            t.state = 'to_bin'
+                            # remove starting position to avoid "moving to same cell" steps
+                            if len(path) > 1:
+                                t.path = path[1:]
+                                t.state = 'to_bin'
+                            else:
+                                # already at target cell: collect immediately
+                                t.path = []
+                                # buscar bin en la misma celda
+                                bins_here = [i for i, b in enumerate(self.bins) if b.pos == bsel.pos]
+                                if bins_here:
+                                    b_idx = bins_here[0]
+                                    b_obj = self.bins[b_idx]
+                                    if b_obj.level > 0:
+                                        amount = min(b_obj.level, t.capacity - t.load)
+                                        if amount > 0:
+                                            t.load += amount
+                                            b_obj.level -= amount
+                                            stats['serviced'] += 1
+                                            self.collected_count += 1
+                                            if hasattr(t, 'collected_bins'):
+                                                t.collected_bins += 1
+                                            # marcar cooldown y liberar reserva
+                                            try:
+                                                b_obj.mark_collected(self.t)
+                                            except Exception:
+                                                b_obj.reserved_by = None
+                                                b_obj.reserved_until = 0
+                                            # si está lleno o poca energía -> ir a depot
+                                            if t.is_full() or t.energy < 0.1 * self.config['truck_energy']:
+                                                depotpos = self.depots[t.home_depot].pos
+                                                pathd = self.plan_with_astar(t, depotpos)
+                                                t.path = pathd if pathd else []
+                                                t.state = 'to_depot'
+                                            else:
+                                                t.state = 'idle'
 
 
             # ---------------------------------------------------------
@@ -593,14 +626,19 @@ class Simulator:
                         continue
 
                     # ahora sí avanzar: pop y mover
+                    prev_pos = t.pos
                     nextpos = t.path.pop(0)
                     t.energy -= t.step_cost()
-                    # distancia
-                    self.total_distance += 1
-                    t.total_distance += 1
-                    t.pos = nextpos
-                    if hasattr(t, 'action_log'):
-                        t.action_log.append(t.pos)
+                    # contar distancia solo si realmente avanza de celda
+                    if nextpos != prev_pos:
+                        self.total_distance += 1
+                        t.total_distance += 1
+                        t.pos = nextpos
+                        if hasattr(t, 'action_log'):
+                            t.action_log.append(t.pos)
+                    else:
+                        # se quedó en la misma celda (no contar como movimiento)
+                        t.pos = nextpos
                     occupied[t.pos].append(t.id)
 
                     # si llegó a un bin
@@ -624,8 +662,12 @@ class Simulator:
                                     if hasattr(t, 'collected_bins'):
                                         t.collected_bins += 1
 
-                                    # marcar que bin empieza cooldown
-                                    b_obj.mark_collected(self.t)
+                                    # marcar que bin empieza cooldown y liberar reserva
+                                    try:
+                                        b_obj.mark_collected(self.t)
+                                    except Exception:
+                                        b_obj.reserved_by = None
+                                        b_obj.reserved_until = 0
 
                                     # si está lleno o poca energía -> ir a depot
                                     if t.is_full() or t.energy < 0.1 * self.config['truck_energy']:
@@ -633,6 +675,10 @@ class Simulator:
                                         path = self.plan_with_astar(t, depotpos)
                                         t.path = path if path else []
                                         t.state = 'to_depot'
+                                    else:
+                                        # si aún puede seguir, liberar estado para reasignación
+                                        t.state = 'idle'
+                                        t.path = []
                             else:
                                 # si bin vacío, liberamos su reserva para que no bloquee
                                 b_obj.reserved_by = None
